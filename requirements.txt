@@ -1,0 +1,7 @@
+requests>=2.31
+numpy>=1.24
+Pillow>=10.0
+cryptography>=41.0
+opencv-python>=4.8
+fastapi>=0.115
+uvicorn[standard]>=0.30
