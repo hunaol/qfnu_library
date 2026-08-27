@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import threading
+import time
+import uuid
 from typing import Any, Callable, TypeVar
+
+import requests
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +25,26 @@ from qfnu_login import (
     LibrarySessionExpired,
     library_login,
 )
+import qfnu_login as q
 
 
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
+
+
+class SliderStartResponse(BaseModel):
+    token: str | None = None
+    requires_slider: bool
+    big_image: str | None = None
+    small_image: str | None = None
+    username: str | None = None
+
+
+class SliderVerifyRequest(BaseModel):
+    token: str
+    move_length: int = Field(ge=1, le=260)
+    tracks: list[dict[str, int]] = Field(min_length=2)
 
 
 class ActionRequest(BaseModel):
@@ -89,6 +109,8 @@ _run_keys: dict[str, str] = {}
 _state_lock = threading.Lock()
 _relogin_lock = threading.Lock()
 _scheduler_task: asyncio.Task[None] | None = None
+_pending_logins: dict[str, dict[str, Any]] = {}
+SHANGHAI_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 T = TypeVar("T")
 
 
@@ -191,7 +213,7 @@ def _run_action(
     with _state_lock:
         _status.update(
             last_action=action,
-            last_run_at=datetime.now().isoformat(timespec="seconds"),
+            last_run_at=datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
             last_message=message,
         )
 
@@ -204,7 +226,7 @@ async def _automation_loop() -> None:
         if not config.enabled or _client is None:
             continue
 
-        now = datetime.now()
+        now = datetime.now(SHANGHAI_TZ)
         current_minute = now.strftime("%H:%M")
         day_key = now.date().isoformat()
         schedules = (
@@ -257,6 +279,128 @@ def login(request: LoginRequest) -> dict[str, str]:
     _username = request.username
     _login_password = request.password
     return {"username": request.username, "name": client.name or request.username}
+
+
+def _complete_manual_login(
+    state: dict[str, Any],
+    move_length: int | None = None,
+    tracks: list[dict[str, int]] | None = None,
+) -> QFNULibraryClient:
+    if move_length is not None and tracks is not None:
+        body = {"canvasLength": 280, "moveLength": move_length, "tracks": tracks}
+        sign = q.encrypt_password(
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            state["secret"],
+        )
+        verify = state["session"].post(
+            q.urljoin(q.LOGIN_URL, q.SLIDER_VERIFY_URL),
+            data={"sign": sign},
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": state["page_url"],
+            },
+            timeout=20,
+        )
+        verify.raise_for_status()
+        if verify.json().get("errorCode") != 1:
+            raise HTTPException(status_code=422, detail="滑块验证未通过，请重新拖动")
+
+    payload = {
+        name: value
+        for name, value in state["parsed"].fields.items()
+        if name not in {"passwordText", "password"}
+    }
+    payload.update(
+        {
+            "username": state["username"],
+            "password": q.encrypt_password(state["password"], state["salt"]),
+            "_eventId": payload.get("_eventId", "submit"),
+            "cllt": payload.get("cllt", "userNameLogin"),
+            "dllt": payload.get("dllt", "generalLogin"),
+        }
+    )
+    response = state["session"].post(
+        state["action"],
+        data=payload,
+        headers={"Referer": state["page_url"]},
+        timeout=20,
+        allow_redirects=False,
+    )
+    state["session"].qfnu_login_location = response.headers.get("Location", "")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=401, detail="登录提交失败，请检查账号密码")
+    return QFNULibraryClient.from_login_session(state["session"])
+
+
+@app.post("/api/auth/login/start", response_model=SliderStartResponse)
+def login_start(request: LoginRequest) -> dict[str, Any]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+    )
+    page = session.get(
+        q.LOGIN_URL,
+        params={"service": q.LIBRARY_CAS_SERVICE},
+        timeout=20,
+    )
+    parsed = q._parse_login_page(page.text)
+    salt = parsed.fields.pop("pwdEncryptSalt", "")
+    if not parsed.has_password_form or not salt:
+        raise HTTPException(status_code=502, detail="登录页结构异常")
+
+    token = uuid.uuid4().hex
+    action = q.urljoin(page.url, parsed.form_action or q.LOGIN_URL)
+    action = (
+        f"{action}{'&' if '?' in action else '?'}"
+        f"{q.urlencode({'service': q.LIBRARY_CAS_SERVICE})}"
+    )
+    state = {
+        "session": session,
+        "page_url": page.url,
+        "parsed": parsed,
+        "salt": salt,
+        "username": request.username,
+        "password": request.password,
+        "action": action,
+        "created": time.time(),
+    }
+    if q._captcha_required(session, request.username, 20):
+        captcha = session.get(
+            q.urljoin(q.LOGIN_URL, q.SLIDER_OPEN_URL),
+            timeout=20,
+        ).json()
+        raw_small = base64.b64decode(captcha["smallImage"])
+        state["secret"] = raw_small[-16:].decode("ascii")
+        _pending_logins[token] = state
+        return {
+            "token": token,
+            "requires_slider": True,
+            "big_image": captcha["bigImage"],
+            "small_image": base64.b64encode(raw_small[:-16]).decode("ascii"),
+            "username": request.username,
+        }
+
+    client = _complete_manual_login(state)
+    global _client, _username, _login_password
+    _client, _username, _login_password = client, request.username, request.password
+    return {"requires_slider": False, "username": request.username}
+
+
+@app.post("/api/auth/login/slider")
+def login_slider(request: SliderVerifyRequest) -> dict[str, str]:
+    state = _pending_logins.pop(request.token, None)
+    if not state or time.time() - state.get("created", time.time()) > 300:
+        raise HTTPException(status_code=410, detail="验证码已过期，请重新开始登录")
+    client = _complete_manual_login(state, request.move_length, request.tracks)
+    global _client, _username, _login_password
+    _client, _username, _login_password = client, state["username"], state["password"]
+    return {"username": _username, "name": client.name or _username}
 
 
 @app.post("/api/auth/logout")

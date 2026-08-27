@@ -48,6 +48,9 @@ let confirmResolver = null
 const isLoggedIn = ref(false)
 const accountName = ref('')
 const loginForm = ref({ username: '', password: '' })
+const loginChallenge = ref(null)
+const sliderMove = ref(0)
+const sliderSubmitting = ref(false)
 const automation = ref({
   enabled: false,
   repeat_daily: false,
@@ -377,13 +380,69 @@ async function loadSeats() {
 
 async function login() {
   try {
-    const response = await fetch('/api/auth/login', {
+    const response = await fetch('/api/auth/login/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(loginForm.value),
     })
     const data = await response.json()
     if (!response.ok) throw new Error(data.detail || '登录失败')
+    if (data.requires_slider) {
+      loginChallenge.value = data
+      sliderMove.value = 0
+      return
+    }
+    await finishLogin(data)
+  } catch (error) {
+    notify(error.message || '无法连接登录服务')
+  }
+}
+
+function buildSliderTracks(length) {
+  const tracks = [{ a: 0, b: 0, c: 0 }]
+  const steps = Math.max(28, Math.min(70, Math.floor(length / 2)))
+  let previous = 0
+  for (let i = 1; i <= steps; i += 1) {
+    const progress = i / steps
+    const position = i === steps ? length : Math.round(length * (1 - (1 - progress) ** 2))
+    if (position <= previous) continue
+    tracks.push({
+      a: position,
+      b: Math.round(2 * Math.sin(progress * Math.PI * 3)),
+      c: 24 + (i % 4) * 7,
+    })
+    previous = position
+  }
+  tracks.push({ a: length, b: 0, c: 45 })
+  return tracks
+}
+
+async function submitSlider() {
+  if (!loginChallenge.value || sliderSubmitting.value) return
+  sliderSubmitting.value = true
+  try {
+    const moveLength = Math.round(sliderMove.value)
+    const response = await fetch('/api/auth/login/slider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: loginChallenge.value.token,
+        move_length: moveLength,
+        tracks: buildSliderTracks(moveLength),
+      }),
+    })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.detail || '滑块验证失败')
+    loginChallenge.value = null
+    await finishLogin(data)
+  } catch (error) {
+    notify(error.message || '滑块验证失败')
+  } finally {
+    sliderSubmitting.value = false
+  }
+}
+
+async function finishLogin(data) {
     isLoggedIn.value = true
     accountName.value = data.username || loginForm.value.username
     showLogin.value = false
@@ -393,9 +452,6 @@ async function login() {
     await loadAutomationSegments()
     await loadSeats()
     notify('已连接统一身份认证')
-  } catch (error) {
-    notify(error.message || '无法连接登录服务')
-  }
 }
 
 async function logout() {
@@ -424,13 +480,13 @@ async function syncSession() {
   }
 }
 
-async function loadAutomation({ notifyExecution = false } = {}) {
+async function loadAutomation({ notifyExecution = false, syncConfig = true } = {}) {
   try {
     const response = await fetch('/api/automation')
     if (!response.ok) return
     const data = await response.json()
     const previous = automationStatus.value
-    automation.value = { ...automation.value, ...data.config }
+    if (syncConfig) automation.value = { ...automation.value, ...data.config }
     automationStatus.value = data
     const changed = data.last_run_at && (
       data.last_run_at !== previous.last_run_at
@@ -449,7 +505,7 @@ async function pollAutomationStatus() {
   if (automationPollInFlight) return
   automationPollInFlight = true
   try {
-    await loadAutomation({ notifyExecution: true })
+    await loadAutomation({ notifyExecution: true, syncConfig: false })
   } finally {
     automationPollInFlight = false
   }
@@ -647,7 +703,7 @@ watch([selectedRoom, selectedDate], async () => {
     <transition name="slide-up"><div v-if="showBooking && selectedSeat" class="booking-drawer"><div class="drawer-handle"></div><div class="drawer-head"><div><span class="section-kicker">CONFIRM RESERVATION</span><h2>确认你的座位</h2></div><button class="icon-button" title="关闭" @click="showBooking = false"><X :size="18" /></button></div><div class="seat-preview"><div class="seat-preview-icon"><Armchair :size="23" /></div><div><strong>A-{{ selectedSeat.number }}</strong><span>{{ room.name }}</span></div><span class="status-pill"><span class="status-dot"></span>空闲</span></div><div class="booking-fields"><label>日期<div class="field-value"><CalendarDays :size="16" />{{ selectedDate }} · {{ dates.find((date) => date.value === selectedDate)?.date }}<ChevronDown :size="16" /></div></label><label>使用时段<div class="segment-tabs drawer-segments"><button v-for="segment in segmentItems" :key="segment.id" :class="{ active: selectedSegment === segment.label }" @click="selectSegment(segment)">{{ segment.label }}</button></div></label></div><button class="secondary-button wide" @click="prepareAutomationReservation"><Zap :size="16" />加入明日定时预约</button><button class="dark-button wide" @click="confirmBooking">确认真实预约 <Check :size="17" /></button><p class="drawer-note"><LockKeyhole :size="14" />确认真实预约会立即提交；定时预约只保存计划</p></div></transition>
     <div v-if="showBooking" class="scrim" @click="showBooking = false"></div>
 
-    <div v-if="showLogin" class="modal-layer"><div class="scrim" @click="showLogin = false"></div><section class="login-modal"><button class="icon-button modal-close" title="关闭" @click="showLogin = false"><X :size="18" /></button><div class="login-mark"><LibraryBig :size="22" /></div><span class="section-kicker">QFNU SINGLE SIGN-ON</span><h2>连接你的图书馆</h2><p>使用统一身份认证账号继续。</p><label>账号<input v-model="loginForm.username" placeholder="请输入学号" /></label><label>密码<input v-model="loginForm.password" type="password" placeholder="请输入密码" /></label><button class="dark-button wide" @click="login">登录并连接 <ArrowUpRight :size="16" /></button><span class="secure-note"><LockKeyhole :size="13" />凭据仅用于本次会话</span></section></div>
+    <div v-if="showLogin" class="modal-layer"><div class="scrim" @click="showLogin = false"></div><section class="login-modal"><button class="icon-button modal-close" title="关闭" @click="showLogin = false"><X :size="18" /></button><div class="login-mark"><LibraryBig :size="22" /></div><span class="section-kicker">QFNU SINGLE SIGN-ON</span><h2>{{ loginChallenge ? '完成安全验证' : '连接你的图书馆' }}</h2><p v-if="!loginChallenge">使用统一身份认证账号继续。</p><template v-if="!loginChallenge"><label>账号<input v-model="loginForm.username" placeholder="请输入学号" /></label><label>密码<input v-model="loginForm.password" type="password" placeholder="请输入密码" /></label><button class="dark-button wide" @click="login">登录并连接 <ArrowUpRight :size="16" /></button></template><template v-else><div class="slider-preview"><img :src="`data:image/png;base64,${loginChallenge.big_image}`" /><img class="slider-piece" :style="{ left: `${sliderMove}px` }" :src="`data:image/png;base64,${loginChallenge.small_image}`" /></div><input class="slider-range" type="range" min="0" max="236" v-model.number="sliderMove" /><button class="dark-button wide" :disabled="sliderSubmitting" @click="submitSlider">{{ sliderSubmitting ? '验证中…' : '提交滑块验证' }} <Check :size="16" /></button><button class="secondary-button wide" @click="loginChallenge = null">返回修改账号</button></template><span class="secure-note"><LockKeyhole :size="13" />凭据仅用于本次会话</span></section></div>
 
     <div v-if="confirmDialog.open" class="modal-layer confirm-layer" @keydown.esc="closeConfirmation(false)"><div class="scrim" @click="closeConfirmation(false)"></div><section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div class="confirm-icon" :class="{ danger: confirmDialog.danger }"><ShieldCheck v-if="!confirmDialog.danger" :size="22" /><X v-else :size="22" /></div><h2 id="confirm-title">{{ confirmDialog.title }}</h2><p>{{ confirmDialog.message }}</p><div class="confirm-actions"><button class="secondary-button" type="button" @click="closeConfirmation(false)">取消</button><button class="dark-button" :class="{ 'danger-button': confirmDialog.danger }" type="button" @click="closeConfirmation(true)">{{ confirmDialog.confirmLabel }}<Check :size="16" /></button></div></section></div>
 
