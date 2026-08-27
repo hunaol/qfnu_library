@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "repeat_daily": false,
+  "reservation_enabled": false,
+  "reservation_time": "19:20",
+  "reservation_classroom": "西校区图书馆-三层自习室",
+  "reservation_seat_id": "",
+  "reservation_segment": "08:00–22:00",
+  "check_in_enabled": true,
+  "check_out_enabled": true,
+  "check_in_time": "10:43",
+  "check_out_time": "10:45",
+  "reservation_id": null
+}

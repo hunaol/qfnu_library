@@ -59,6 +59,10 @@ class LibraryError(RuntimeError):
     pass
 
 
+class LibrarySessionExpired(LibraryError):
+    """Raised when the library API no longer accepts the current session."""
+
+
 def _library_date(value: str | None) -> str:
     if not value or value == "tomorrow":
         result = datetime.now().date() + timedelta(days=1)
@@ -145,13 +149,18 @@ class QFNULibraryClient:
     def _request(self, method: str, path: str, **kwargs) -> dict:
         kwargs.setdefault("timeout", 30)
         response = self.session.request(method, f"{LIBRARY_BASE_URL}{path}", **kwargs)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            if response.status_code in {401, 403}:
+                raise LibrarySessionExpired("图书馆会话已失效，请重新登录") from exc
+            raise
         try:
             payload = response.json()
         except ValueError as exc:
             raise LibraryError(f"图书馆接口返回了非 JSON 响应：{path}") from exc
         if isinstance(payload, dict) and payload.get("msg") == "您尚未登录":
-            raise LibraryError("图书馆会话已失效，请重新登录")
+            raise LibrarySessionExpired("图书馆会话已失效，请重新登录")
         if isinstance(payload, dict) and payload.get("code") not in (None, 1):
             message = payload.get("msg") or payload.get("message") or "图书馆接口返回失败"
             raise LibraryError(f"{message}（code={payload.get('code')}）")
