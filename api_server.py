@@ -187,6 +187,22 @@ def seats(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/library/seat-map")
+def seat_map(
+    classroom: str,
+    target_date: str | None = None,
+    start_time: str = "08:00",
+    end_time: str = "22:00",
+    segment: str | None = None,
+) -> list[dict]:
+    try:
+        return _require_client().seat_map(
+            classroom, target_date, start_time, end_time, segment
+        )
+    except LibraryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/library/reservations")
 def reservations() -> list[dict]:
     try:

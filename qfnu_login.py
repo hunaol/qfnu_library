@@ -152,6 +152,9 @@ class QFNULibraryClient:
             raise LibraryError(f"图书馆接口返回了非 JSON 响应：{path}") from exc
         if isinstance(payload, dict) and payload.get("msg") == "您尚未登录":
             raise LibraryError("图书馆会话已失效，请重新登录")
+        if isinstance(payload, dict) and payload.get("code") not in (None, 1):
+            message = payload.get("msg") or payload.get("message") or "图书馆接口返回失败"
+            raise LibraryError(f"{message}（code={payload.get('code')}）")
         return payload
 
     def segments(self, classroom: str, target_date: str | None = None) -> list[dict]:
@@ -176,6 +179,21 @@ class QFNULibraryClient:
         segment = segment or ((self.segments(classroom, day) or [{}])[0].get("id"))
         if not segment:
             raise LibraryError(f"{classroom} 在 {day} 没有可用时段")
+        return [seat for seat in self.seat_map(classroom, day, start_time, end_time, segment) if seat["status"] == "空闲"]
+
+    def seat_map(
+        self,
+        classroom: str,
+        target_date: str | None = None,
+        start_time: str = "08:00",
+        end_time: str = "22:00",
+        segment: str | None = None,
+    ) -> list[dict]:
+        """Return every seat and its state, matching the official H5 page."""
+        day = _library_date(target_date)
+        segment = segment or ((self.segments(classroom, day) or [{}])[0].get("id"))
+        if not segment:
+            raise LibraryError(f"{classroom} 在 {day} 没有可用时段")
         payload = self._request(
             "POST",
             "/api/Seat/seat",
@@ -187,17 +205,29 @@ class QFNULibraryClient:
                 "endTime": end_time,
             },
         )
-        return [
-            {"id": seat.get("id"), "no": seat.get("no"), "status": seat.get("status_name")}
-            for seat in payload.get("data", [])
-            if seat.get("status_name") == "空闲"
-        ]
+        result = []
+        for seat in payload.get("data", []):
+            status = seat.get("status_name") or seat.get("statusName") or seat.get("status") or "未知"
+            result.append(
+                {
+                    "id": seat.get("id"),
+                    "no": seat.get("no") or seat.get("name"),
+                    "name": seat.get("name") or seat.get("no"),
+                    "status": status,
+                    "status_code": seat.get("status"),
+                    "area": seat.get("area") or self._classroom_id(classroom),
+                    "area_name": seat.get("area_name") or seat.get("areaName") or classroom,
+                    "point_x": seat.get("point_x"),
+                    "point_y": seat.get("point_y"),
+                }
+            )
+        return result
 
     def reservations(self) -> list[dict]:
         payload = self._request(
             "POST",
             "/api/Member/seat",
-            json={"page": 1, "limit": 20, "authorization": self.bearer_token},
+            json={"page": 1, "limit": 100, "authorization": self.bearer_token},
             headers={"Authorization": self.bearer_token},
         )
         data = payload.get("data", {})
@@ -510,7 +540,9 @@ def login(
 
     params = {"service": service} if service else None
     page = session.get(LOGIN_URL, params=params, timeout=timeout)
-    page.raise_for_status()
+    if page.status_code >= 400:
+        detail = _extract_error(page.text) or page.reason or "登录页请求被拒绝"
+        raise QFNULoginError(f"登录页请求失败（HTTP {page.status_code}）：{detail}")
     parsed = _parse_login_page(page.text)
     salt = parsed.fields.pop("pwdEncryptSalt", "")
     if not parsed.has_password_form or not salt:
@@ -545,7 +577,12 @@ def login(
         allow_redirects=follow_redirects,
     )
     session.qfnu_login_location = response.headers.get("Location", "")
-    response.raise_for_status()
+    if response.status_code >= 400:
+        detail = _extract_error(response.text) or response.reason or "服务器未返回具体原因"
+        raise QFNULoginError(
+            f"登录提交失败（HTTP {response.status_code}）：{detail}。"
+            "请确认账号密码、滑块验证和账号状态。"
+        )
 
     result_page = _parse_login_page(response.text)
     path = urlparse(response.url).path.rstrip("/")

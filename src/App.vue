@@ -55,12 +55,12 @@ const automationSaving = ref(false)
 const toast = ref('')
 let toastTimer
 
-const rooms = [
+const rooms = ref([
   { name: '西校区图书馆 · 三层自习室', short: '西校区 · 三层', seats: 168, open: '08:00–22:00', accent: 'mint' },
   { name: '西校区图书馆 · 四层自习室', short: '西校区 · 四层', seats: 144, open: '08:00–22:00', accent: 'blue' },
   { name: '东校区图书馆 · 三层自习室 01', short: '东校区 · 三层 01', seats: 96, open: '08:00–22:00', accent: 'orange' },
   { name: '综合楼 · 805 自习室', short: '综合楼 · 805', seats: 48, open: '08:00–21:30', accent: 'violet' },
-]
+])
 
 const segments = ['08:00–09:00', '09:00–12:00', '12:00–14:00', '14:00–18:00', '18:00–22:00']
 const navItems = [
@@ -70,23 +70,25 @@ const navItems = [
   { id: 'automation', label: '自动执行', icon: Zap },
 ]
 
-const room = computed(() => rooms[selectedRoom.value])
+const room = computed(() => rooms.value[selectedRoom.value] || rooms.value[0])
 const apiDate = computed(() => {
   if (selectedDate.value === '今天') return 'today'
   if (selectedDate.value === '明天') return 'tomorrow'
   return new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10)
 })
 const segmentItems = computed(() => {
-  if (!remoteSegments.value.length) return segments.map((label, index) => ({ id: String(index + 1), label }))
+  if (!remoteSegments.value.length) {
+    return isLoggedIn.value ? [] : segments.map((label, index) => ({ id: String(index + 1), label }))
+  }
   return remoteSegments.value.map((item, index) => ({
     id: String(item.id ?? item.segment ?? index + 1),
     label: item.name || item.title || item.time || item.segment_name || `${item.start || item.startTime || ''}–${item.end || item.endTime || ''}`,
   }))
 })
 const dates = computed(() => [
-  { label: '今天', value: '今天', date: '08月26日' },
-  { label: '明天', value: '明天', date: '08月27日' },
-  { label: '周五', value: '周五', date: '08月28日' },
+  { label: '今天', value: '今天', date: formatDate(0) },
+  { label: '明天', value: '明天', date: formatDate(1) },
+  { label: weekdayLabel(2), value: '后天', date: formatDate(2) },
 ])
 
 const mockSeats = computed(() => Array.from({ length: 64 }, (_, index) => {
@@ -106,12 +108,25 @@ const seats = computed(() => {
   return remoteSeats.value.map((seat, index) => ({
     id: String(seat.id),
     number: String(seat.no ?? seat.number ?? index + 1).padStart(2, '0'),
-    status: 'available',
+    status: seat.status === '空闲' ? 'available' : seat.status === '已预约' ? 'reserved' : seat.status === '使用中' ? 'occupied' : 'cleaning',
   }))
 })
 
 const availableCount = computed(() => seats.value.filter((seat) => seat.status === 'available').length)
-const occupancy = computed(() => Math.round(((64 - availableCount.value) / 64) * 100))
+const occupancy = computed(() => {
+  const total = seats.value.length
+  return total ? Math.round(((total - availableCount.value) / total) * 100) : 0
+})
+
+function formatDate(offset) {
+  const date = new Date(Date.now() + offset * 86400000)
+  return `${String(date.getMonth() + 1).padStart(2, '0')}月${String(date.getDate()).padStart(2, '0')}日`
+}
+
+function weekdayLabel(offset) {
+  const date = new Date(Date.now() + offset * 86400000)
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getDay()]
+}
 
 const reservations = ref([])
 
@@ -135,6 +150,10 @@ function selectSegment(item) {
 
 async function confirmBooking() {
   if (!selectedSeat.value) return
+  if (!selectedSegmentId.value) {
+    notify('当前空间和日期暂无可预约时段')
+    return
+  }
   if (!isLoggedIn.value) {
     showBooking.value = false
     showLogin.value = true
@@ -202,6 +221,27 @@ async function loadReservations() {
   }
 }
 
+async function loadClassrooms() {
+  if (!isLoggedIn.value) return
+  try {
+    const response = await fetch('/api/library/classrooms')
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.detail || '空间列表读取失败')
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return
+    rooms.value = Object.entries(data).map(([name, id], index) => ({
+      name,
+      short: name.replace('图书馆-', ' · ').replace('自习室', ''),
+      seats: 0,
+      open: '08:00–22:00',
+      accent: ['mint', 'blue', 'orange', 'violet'][index % 4],
+      id,
+    }))
+    if (selectedRoom.value >= rooms.value.length) selectedRoom.value = 0
+  } catch (error) {
+    notify(error.message || '无法读取真实空间列表')
+  }
+}
+
 async function loadSegments() {
   if (!isLoggedIn.value) return
   try {
@@ -211,8 +251,16 @@ async function loadSegments() {
     if (!response.ok) throw new Error(data.detail || '时段读取失败')
     remoteSegments.value = Array.isArray(data) ? data : []
     const first = segmentItems.value[0]
-    if (first && !segmentItems.value.some((item) => item.label === selectedSegment.value)) selectedSegment.value = first.label
-    if (first && !selectedSegmentId.value) selectedSegmentId.value = first.id
+    const matching = segmentItems.value.find((item) => item.label === selectedSegment.value)
+    if (matching) {
+      selectedSegmentId.value = matching.id
+    } else if (first) {
+      selectedSegment.value = first.label
+      selectedSegmentId.value = first.id
+    } else {
+      selectedSegment.value = ''
+      selectedSegmentId.value = ''
+    }
   } catch (error) {
     remoteSegments.value = []
     notify(error.message || '无法读取真实时段')
@@ -224,7 +272,7 @@ async function loadSeats() {
   try {
     const params = new URLSearchParams({ classroom: room.value.name, target_date: apiDate.value, start_time: '08:00', end_time: '22:00' })
     if (selectedSegmentId.value) params.set('segment', selectedSegmentId.value)
-    const response = await fetch(`/api/library/seats?${params}`)
+    const response = await fetch(`/api/library/seat-map?${params}`)
     const data = await response.json()
     if (!response.ok) throw new Error(data.detail || '座位读取失败')
     remoteSeats.value = Array.isArray(data) ? data : []
@@ -247,7 +295,9 @@ async function login() {
     accountName.value = data.username || loginForm.value.username
     showLogin.value = false
     loginForm.value.password = ''
-    await Promise.all([loadAutomation(), loadReservations(), loadSegments(), loadSeats()])
+    await Promise.all([loadAutomation(), loadClassrooms(), loadReservations()])
+    await loadSegments()
+    await loadSeats()
     notify('已连接统一身份认证')
   } catch (error) {
     notify(error.message || '无法连接登录服务')
@@ -269,7 +319,11 @@ async function syncSession() {
     const data = await response.json()
     isLoggedIn.value = Boolean(data.logged_in)
     accountName.value = data.username || ''
-    if (isLoggedIn.value) await Promise.all([loadReservations(), loadSegments(), loadSeats()])
+    if (isLoggedIn.value) {
+      await Promise.all([loadClassrooms(), loadReservations()])
+      await loadSegments()
+      await loadSeats()
+    }
   } catch {
     isLoggedIn.value = false
   }
@@ -317,6 +371,9 @@ syncSession()
 
 watch([selectedRoom, selectedDate], async () => {
   if (!isLoggedIn.value) return
+  // A segment ID is scoped to the selected space and date.
+  selectedSegmentId.value = ''
+  remoteSegments.value = []
   await loadSegments()
   await loadSeats()
 })
@@ -378,7 +435,7 @@ watch([selectedRoom, selectedDate], async () => {
         <div class="metrics-grid">
           <div class="metric-card metric-primary">
             <div class="metric-icon"><Armchair :size="18" /></div>
-            <div><span class="metric-label">可用座位</span><strong>{{ availableCount }}</strong><span class="metric-detail">/ 64 个座位</span></div>
+            <div><span class="metric-label">可用座位</span><strong>{{ availableCount }}</strong><span class="metric-detail">/ {{ seats.length }} 个座位</span></div>
             <div class="metric-trend"><CheckCircle2 :size="14" />状态良好</div>
           </div>
           <div class="metric-card">
@@ -448,7 +505,7 @@ watch([selectedRoom, selectedDate], async () => {
       </section>
     </main>
 
-    <transition name="slide-up"><div v-if="showBooking && selectedSeat" class="booking-drawer"><div class="drawer-handle"></div><div class="drawer-head"><div><span class="section-kicker">CONFIRM RESERVATION</span><h2>确认你的座位</h2></div><button class="icon-button" title="关闭" @click="showBooking = false"><X :size="18" /></button></div><div class="seat-preview"><div class="seat-preview-icon"><Armchair :size="23" /></div><div><strong>A-{{ selectedSeat.number }}</strong><span>{{ room.name }}</span></div><span class="status-pill"><span class="status-dot"></span>空闲</span></div><div class="booking-fields"><label>日期<div class="field-value"><CalendarDays :size="16" />{{ selectedDate }} · 08月27日<ChevronDown :size="16" /></div></label><label>使用时段<div class="segment-tabs drawer-segments"><button v-for="segment in segmentItems" :key="segment.id" :class="{ active: selectedSegment === segment.label }" @click="selectSegment(segment)">{{ segment.label }}</button></div></label></div><button class="dark-button wide" @click="confirmBooking">确认真实预约 <Check :size="17" /></button><p class="drawer-note"><LockKeyhole :size="14" />确认后将向图书馆提交真实预约</p></div></transition>
+    <transition name="slide-up"><div v-if="showBooking && selectedSeat" class="booking-drawer"><div class="drawer-handle"></div><div class="drawer-head"><div><span class="section-kicker">CONFIRM RESERVATION</span><h2>确认你的座位</h2></div><button class="icon-button" title="关闭" @click="showBooking = false"><X :size="18" /></button></div><div class="seat-preview"><div class="seat-preview-icon"><Armchair :size="23" /></div><div><strong>A-{{ selectedSeat.number }}</strong><span>{{ room.name }}</span></div><span class="status-pill"><span class="status-dot"></span>空闲</span></div><div class="booking-fields"><label>日期<div class="field-value"><CalendarDays :size="16" />{{ selectedDate }} · {{ dates.find((date) => date.value === selectedDate)?.date }}<ChevronDown :size="16" /></div></label><label>使用时段<div class="segment-tabs drawer-segments"><button v-for="segment in segmentItems" :key="segment.id" :class="{ active: selectedSegment === segment.label }" @click="selectSegment(segment)">{{ segment.label }}</button></div></label></div><button class="dark-button wide" @click="confirmBooking">确认真实预约 <Check :size="17" /></button><p class="drawer-note"><LockKeyhole :size="14" />确认后将向图书馆提交真实预约</p></div></transition>
     <div v-if="showBooking" class="scrim" @click="showBooking = false"></div>
 
     <div v-if="showLogin" class="modal-layer"><div class="scrim" @click="showLogin = false"></div><section class="login-modal"><button class="icon-button modal-close" title="关闭" @click="showLogin = false"><X :size="18" /></button><div class="login-mark"><LibraryBig :size="22" /></div><span class="section-kicker">QFNU SINGLE SIGN-ON</span><h2>连接你的图书馆</h2><p>使用统一身份认证账号继续。</p><label>账号<input v-model="loginForm.username" placeholder="请输入学号" /></label><label>密码<input v-model="loginForm.password" type="password" placeholder="请输入密码" /></label><button class="dark-button wide" @click="login">登录并连接 <ArrowUpRight :size="16" /></button><span class="secure-note"><LockKeyhole :size="13" />凭据仅用于本次会话</span></section></div>
